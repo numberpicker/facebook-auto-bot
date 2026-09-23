@@ -59,7 +59,7 @@ export const env = {
     return optional("GROQ_API_KEY");
   },
   get geminiApiKey() {
-    return optional("AQ.Ab8RN6LUmaA-6iv6nOHzaYjyq9XsrDFEtjPd_S8Lv9Kbn4vnIQ");
+    return optional("GEMENI_API_KEY");
   },
 
   // Free image sources
