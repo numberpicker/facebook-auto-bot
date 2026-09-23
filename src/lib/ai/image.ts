@@ -5,32 +5,61 @@ import type { ImageSource, ImageSourcePref } from "@/lib/types";
 
 const STORAGE_BUCKET = "post-images";
 
-// Square reads well in the Facebook feed on both mobile and desktop, and
-// avoids the centre-crop that wide images get in the timeline.
-const WIDTH = 1200;
-const HEIGHT = 1200;
-
 export function resolveImageSource(pref: ImageSourcePref): ImageSource {
   if (pref === "mixed") return Math.random() < 0.5 ? "ai" : "stock";
   return pref;
 }
 
-/**
- * Topics phrased as listicles ("easy weeknight dinner ideas") make the model
- * return a grid of thumbnails, which reads as a stock collage in the feed.
- * Steering it toward one photographed subject fixes that.
- */
 const PHOTO_STYLE =
   "single subject, professional photograph, natural light, shallow depth of field, high detail, no text, no watermark, no collage, no grid";
 
+/**
+ * Generates an image using Google Gemini (Imagen 3) API
+ */
 async function fetchAiImageBytes(prompt: string): Promise<Blob> {
-  const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(
-    `${prompt}, ${PHOTO_STYLE}`
-  )}?width=${WIDTH}&height=${HEIGHT}&nologo=true&seed=${Math.floor(Math.random() * 1_000_000)}`;
+  const apiKey = env.geminiApiKey || process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error("GEMINI_API_KEY is not configured");
+  }
 
-  const res = await fetch(url, { signal: AbortSignal.timeout(30_000) });
-  if (!res.ok) throw new Error(`Pollinations image API ${res.status}`);
-  return res.blob();
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-002:predict`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "x-goog-api-key": apiKey,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      instances: [
+        {
+          prompt: `${prompt}, ${PHOTO_STYLE}`,
+        },
+      ],
+      parameters: {
+        sampleCount: 1,
+        aspectRatio: "1:1", // 1:1 aspect ratio replaces custom 1200x1200 px size
+        outputMimeType: "image/jpeg",
+      },
+    }),
+    signal: AbortSignal.timeout(30_000),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`Gemini Imagen API error standard status ${res.status}: ${errText}`);
+  }
+
+  const data = await res.json();
+  const base64Data = data.predictions?.[0]?.bytesBase64Encoded;
+
+  if (!base64Data) {
+    throw new Error("Gemini API returned no image data");
+  }
+
+  // Convert Base64 back to Blob for uploading to Supabase
+  const buffer = Buffer.from(base64Data, "base64");
+  return new Blob([buffer], { type: "image/jpeg" });
 }
 
 async function fetchStockImageBytes(query: string): Promise<Blob> {
@@ -58,14 +87,6 @@ async function fetchStockImageBytes(query: string): Promise<Blob> {
   return imageRes.blob();
 }
 
-/**
- * Generates or sources a post image, then re-hosts it in our own Supabase
- * Storage bucket rather than linking the free provider's URL directly. Both
- * free providers are best-effort community services with no uptime guarantee —
- * re-hosting means a post's image keeps working forever, and Facebook's own
- * fetcher (which downloads the image itself at publish time) always sees a
- * stable, fast, first-party URL.
- */
 export async function generateImage(
   prompt: string,
   pref: ImageSourcePref
@@ -76,7 +97,6 @@ export async function generateImage(
   try {
     blob = source === "ai" ? await fetchAiImageBytes(prompt) : await fetchStockImageBytes(prompt);
   } catch (err) {
-    // Fall back to the other free source rather than failing the whole generation.
     const fallbackSource: ImageSource = source === "ai" ? "stock" : "ai";
     try {
       blob =
