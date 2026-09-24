@@ -1,4 +1,4 @@
-# Facebook Auto Bot
+# Facebook Auto Bot Alpha
 
 Pick a topic — or let it pick one — and it writes a Facebook Page post, generates a
 matching image, and publishes it. On autopilot it does all of that on a schedule with
