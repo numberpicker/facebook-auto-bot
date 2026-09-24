@@ -53,13 +53,18 @@ export const env = {
     return optional("FACEBOOK_REDIRECT_URI");
   },
 
-  // Free-tier LLM keys. Both are optional: without either one the app falls
-  // back to the keyless Pollinations endpoint, and then to template copy.
+  // Free-tier AI keys. Optional: without one the app falls back to the
+  // keyless Pollinations endpoint, and then to template copy.
   get groqApiKey() {
     return optional("GROQ_API_KEY");
   },
+  /**
+   * Gemini key, used for both text and image generation. The misspelled
+   * GEMENI_API_KEY is still read as a fallback so installs that set the old
+   * name keep working; new installs should set GEMINI_API_KEY.
+   */
   get geminiApiKey() {
-    return optional("GEMENI_API_KEY");
+    return optional("GEMINI_API_KEY") || optional("GEMENI_API_KEY");
   },
 
   // Free image sources
