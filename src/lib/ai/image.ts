@@ -10,6 +10,8 @@ const STORAGE_BUCKET = "post-images";
 const WIDTH = 1200;
 const HEIGHT = 1200;
 
+const GEMINI_IMAGE_MODEL = "gemini-2.5-flash-image";
+
 export function resolveImageSource(pref: ImageSourcePref): ImageSource {
   if (pref === "mixed") return Math.random() < 0.5 ? "ai" : "stock";
   return pref;
@@ -23,7 +25,65 @@ export function resolveImageSource(pref: ImageSourcePref): ImageSource {
 const PHOTO_STYLE =
   "single subject, professional photograph, natural light, shallow depth of field, high detail, no text, no watermark, no collage, no grid";
 
+/**
+ * Gemini's image model returns the picture as base64 inline data rather than
+ * a URL, so it is decoded into a Blob here to match what the uploader and the
+ * Pollinations/Pexels paths already produce.
+ */
+async function fetchGeminiImageBytes(prompt: string, apiKey: string): Promise<Blob> {
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_IMAGE_MODEL}:generateContent?key=${apiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: `${prompt}, ${PHOTO_STYLE}` }] }],
+      }),
+      signal: AbortSignal.timeout(60_000),
+    }
+  );
+
+  if (!res.ok) {
+    if (res.status === 429) throw new Error("Gemini image quota exceeded");
+    if (res.status === 400 || res.status === 403) {
+      throw new Error(`Gemini rejected the key (${res.status})`);
+    }
+    throw new Error(`Gemini image API ${res.status}`);
+  }
+
+  const data = await res.json();
+  const parts: Array<{ inlineData?: { data?: string; mimeType?: string } }> =
+    data?.candidates?.[0]?.content?.parts ?? [];
+  const inline = parts.find((p) => p.inlineData?.data)?.inlineData;
+  if (!inline?.data) throw new Error("Gemini returned no image data");
+
+  const bytes = Buffer.from(inline.data, "base64");
+  return new Blob([bytes], { type: inline.mimeType || "image/png" });
+}
+
+/**
+ * AI-generated image, Gemini first and Pollinations as the fallback. Both are
+ * best-effort: the free Gemini tier has a daily image quota that is easy to
+ * hit, and Pollinations is a keyless community service with no uptime
+ * guarantee — so whichever succeeds, the bytes are re-hosted in our own
+ * Storage bucket before being returned.
+ */
 async function fetchAiImageBytes(prompt: string): Promise<Blob> {
+  const geminiKey = env.geminiApiKey;
+
+  if (geminiKey) {
+    try {
+      return await fetchGeminiImageBytes(prompt, geminiKey);
+    } catch (err) {
+      // Fall through to Pollinations rather than failing the request — the
+      // free Gemini tier has a daily image quota and it is easy to hit.
+      console.warn(
+        "[generateImage] Gemini failed, trying Pollinations:",
+        err instanceof Error ? err.message : err
+      );
+    }
+  }
+
   const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(
     `${prompt}, ${PHOTO_STYLE}`
   )}?width=${WIDTH}&height=${HEIGHT}&nologo=true&seed=${Math.floor(Math.random() * 1_000_000)}`;
