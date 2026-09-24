@@ -5,14 +5,15 @@ import type { ContentProvider, GeneratedContent } from "@/lib/types";
  * Facebook copy generation across free LLM providers, tried in order until
  * one returns usable JSON.
  *
- * Pollinations is the only keyless option, but its text endpoint now answers
+ * Gemini is the intended provider and goes first whenever a key is present.
+ * Groq and Pollinations stay as fallbacks so that hitting Gemini's free-tier
+ * quota does not drop the caller straight to template copy. Pollinations is
+ * the only keyless option, but its text endpoint now answers
  * `402 Payment Required` for anonymous callers — inside a 200 response body,
- * so the status alone does not reveal it. Groq and Gemini both have free tiers
- * that need nothing but a no-cost API key, so they are preferred whenever one
- * is configured. If every provider fails the caller still gets a postable
- * draft from a deterministic template, but the result says so via `provider`:
- * silently shipping template copy as if it were AI copy is worse than an
- * honest warning.
+ * so the status alone does not reveal it. If every provider fails the caller
+ * still gets a postable draft from a deterministic template, but the result
+ * says so via `provider`: silently shipping template copy as if it were AI
+ * copy is worse than an honest warning.
  */
 
 const SYSTEM_PROMPT = `You are an expert Facebook Page copywriter. Given a topic, write a single
@@ -29,6 +30,23 @@ Rules:
 - Output ONLY the JSON object. No markdown fences, no commentary.`;
 
 const TIMEOUT_MS = 20_000;
+
+const GEMINI_MODEL = "gemini-2.5-flash";
+
+/**
+ * Shape Gemini is told to return. Declaring it (rather than only setting
+ * responseMimeType) is what makes the model's JSON output reliable enough
+ * that parseContent almost never has to fall back.
+ */
+const CONTENT_SCHEMA = {
+  type: "object",
+  properties: {
+    title: { type: "string" },
+    description: { type: "string" },
+    hashtags: { type: "array", items: { type: "string" } },
+  },
+  required: ["title", "description", "hashtags"],
+} as const;
 
 function extractJson(text: string): unknown {
   const start = text.indexOf("{");
@@ -99,20 +117,33 @@ async function chatCompletion(
 
 async function geminiCompletion(topic: string, apiKey: string): Promise<string> {
   const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
         contents: [{ role: "user", parts: [{ text: `Topic: ${topic}` }] }],
-        generationConfig: { temperature: 0.9, responseMimeType: "application/json" },
+        generationConfig: {
+          temperature: 0.9,
+          responseMimeType: "application/json",
+          responseSchema: CONTENT_SCHEMA,
+        },
       }),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     }
   );
 
-  if (!res.ok) throw new Error(`gemini responded ${res.status}`);
+  if (!res.ok) {
+    // 429 is the free-tier quota; worth naming so the console warning is
+    // actionable rather than just "gemini responded 429".
+    if (res.status === 429) throw new Error("Gemini quota exceeded");
+    if (res.status === 400 || res.status === 403) {
+      throw new Error(`Gemini rejected the key (${res.status})`);
+    }
+    throw new Error(`gemini responded ${res.status}`);
+  }
+
   const data = await res.json();
   const content: unknown = data?.candidates?.[0]?.content?.parts?.[0]?.text;
   if (typeof content !== "string" || !content.trim()) throw new Error("Empty completion");
@@ -134,8 +165,14 @@ type Attempt = { provider: ContentProvider; run: () => Promise<string> };
 function providerChain(topic: string): Attempt[] {
   const chain: Attempt[] = [];
 
-  // A configured free-tier key beats the keyless service on both quality and
-  // reliability, so those go first whenever one is present.
+  // Gemini is the intended provider for both text and images. Groq and
+  // Pollinations stay as fallbacks so a Gemini quota hit doesn't drop the
+  // user straight to template copy.
+  const geminiKey = env.geminiApiKey;
+  if (geminiKey) {
+    chain.push({ provider: "gemini", run: () => geminiCompletion(topic, geminiKey) });
+  }
+
   // Groq retires model ids without notice (llama-3.3-70b-versatile vanished
   // mid-build), so try a short list rather than pinning a single name.
   const groqKey = env.groqApiKey;
@@ -147,11 +184,6 @@ function providerChain(topic: string): Attempt[] {
           chatCompletion("https://api.groq.com/openai/v1/chat/completions", model, topic, groqKey),
       });
     }
-  }
-
-  const geminiKey = env.geminiApiKey;
-  if (geminiKey) {
-    chain.push({ provider: "gemini", run: () => geminiCompletion(topic, geminiKey) });
   }
 
   chain.push({
